@@ -1,18 +1,24 @@
-const nodemailer                    = require('nodemailer');
-const supabase                      = require('../config/supabase');
+const nodemailer                        = require('nodemailer');
+const supabase                          = require('../config/supabase');
 const { resolveTemplate, pickTemplate } = require('./templateEngine');
-const { resolveCV }                 = require('./cvResolver');
-const { createNotification }        = require('./notificationService');
+const { resolveCV }                     = require('./cvResolver');
+const { createNotification }            = require('./notificationService');
 
 /**
  * Create a nodemailer transporter for a user's Gmail
+ * Uses port 587 with STARTTLS — works on Render free tier
  */
 const createTransporter = (gmail, appPassword) => {
   return nodemailer.createTransport({
-    service: 'gmail',
+    host:   'smtp.gmail.com',
+    port:   587,
+    secure: false,
     auth: {
       user: gmail,
       pass: appPassword,
+    },
+    tls: {
+      rejectUnauthorized: false,
     },
   });
 };
@@ -115,7 +121,7 @@ const runBatch = async (userId) => {
       return;
     }
 
-    // Get pending companies (not blacklisted, not yet sent or needing follow-up)
+    // Get pending companies
     const { data: pending } = await supabase
       .from('companies')
       .select('*')
@@ -150,7 +156,7 @@ const runBatch = async (userId) => {
         .select('template_id')
         .eq('company_id', company.id);
 
-      const usedIds = (prevLogs || []).map(l => l.template_id);
+      const usedIds  = (prevLogs || []).map(l => l.template_id);
       const template = pickTemplate(mainTemplates, company, usedIds);
 
       if (!template) continue;
@@ -169,7 +175,9 @@ const runBatch = async (userId) => {
 
         // Wait interval between emails
         if (sent < toSend.length && settings.interval_minutes > 0) {
-          await new Promise(resolve => setTimeout(resolve, settings.interval_minutes * 60 * 1000));
+          await new Promise(resolve =>
+            setTimeout(resolve, settings.interval_minutes * 60 * 1000)
+          );
         }
       }
     }
