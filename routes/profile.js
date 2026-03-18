@@ -21,6 +21,7 @@ router.put('/', auth, async (req, res) => {
     full_name, role, bio, skills,
     portfolio_url, linkedin, github,
     twitter, custom_links, accent_color,
+    gmail, gmail_app_password, cv_url,
   } = req.body;
 
   const { data, error } = await supabase
@@ -29,6 +30,7 @@ router.put('/', auth, async (req, res) => {
       full_name, role, bio, skills,
       portfolio_url, linkedin, github,
       twitter, custom_links, accent_color,
+      gmail, gmail_app_password, cv_url,
       updated_at: new Date(),
     })
     .eq('id', req.user.id)
