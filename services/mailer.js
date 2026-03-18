@@ -1,59 +1,49 @@
-const nodemailer                        = require('nodemailer');
+const { Resend }                        = require('resend');
 const supabase                          = require('../config/supabase');
 const { resolveTemplate, pickTemplate } = require('./templateEngine');
 const { resolveCV }                     = require('./cvResolver');
 const { createNotification }            = require('./notificationService');
 
-/**
- * Create a nodemailer transporter for a user's Gmail
- * Uses port 587 with STARTTLS — works on Render free tier
- */
-const createTransporter = (gmail, appPassword) => {
-  return nodemailer.createTransport({
-    host:   'smtp.gmail.com',
-    port:   587,
-    secure: false,
-    auth: {
-      user: gmail,
-      pass: appPassword,
-    },
-    tls: {
-      rejectUnauthorized: false,
-    },
-  });
-};
+const resend = new Resend(process.env.RESEND_API_KEY);
 
 /**
  * Send a single email to a company
  */
 const sendEmail = async ({ userId, company, template, profile, works, isFollowup = false }) => {
   try {
-    if (!profile.gmail || !profile.gmail_app_password) {
-      throw new Error('Gmail credentials not configured');
+    if (!profile.gmail) {
+      throw new Error('Gmail address not configured — needed as reply-to');
     }
-
-    const transporter = createTransporter(profile.gmail, profile.gmail_app_password);
 
     const subject = resolveTemplate(template.subject, { company, profile, works });
     const body    = resolveTemplate(template.body,    { company, profile, works });
     const cvUrl   = resolveCV(template, profile);
 
-    const mailOptions = {
-      from:    `${profile.full_name} <${profile.gmail}>`,
-      to:      company.employee_email,
-      subject: subject,
-      text:    body,
+    const emailPayload = {
+      from:     `${profile.full_name} <onboarding@resend.dev>`,
+      to:       [company.employee_email],
+      reply_to: profile.gmail,
+      subject:  subject,
+      text:     body,
     };
 
     // Attach CV if available
     if (cvUrl) {
-      mailOptions.attachments = [{
-        filename: 'CV.pdf',
-        path:     cvUrl,
-      }];
+      try {
+        const response = await fetch(cvUrl);
+        const buffer   = await response.arrayBuffer();
+        emailPayload.attachments = [{
+          filename: 'CV.pdf',
+          content:  Buffer.from(buffer),
+        }];
+      } catch (attachErr) {
+        console.error('CV attachment error:', attachErr.message);
+      }
     }
 
-    await transporter.sendMail(mailOptions);
+    const { data, error } = await resend.emails.send(emailPayload);
+
+    if (error) throw new Error(error.message);
 
     // Log the email
     await supabase.from('email_logs').insert({
@@ -74,7 +64,9 @@ const sendEmail = async ({ userId, company, template, profile, works, isFollowup
       })
       .eq('id', company.id);
 
+    console.log(`Email sent to ${company.employee_email} — ID: ${data?.id}`);
     return { success: true };
+
   } catch (err) {
     console.error(`Failed to send to ${company.employee_email}:`, err.message);
     return { success: false, error: err.message };
@@ -83,11 +75,9 @@ const sendEmail = async ({ userId, company, template, profile, works, isFollowup
 
 /**
  * Run a sending batch for a user
- * Sends up to daily_limit emails with interval_minutes between each
  */
 const runBatch = async (userId) => {
   try {
-    // Get settings
     const { data: settings } = await supabase
       .from('settings')
       .select('*')
@@ -96,18 +86,16 @@ const runBatch = async (userId) => {
 
     if (!settings) return;
 
-    // Get profile + works
     const { data: profile } = await supabase
       .from('profiles')
       .select('*, works(*)')
       .eq('id', userId)
       .single();
 
-    if (!profile?.gmail || !profile?.gmail_app_password) return;
+    if (!profile?.gmail) return;
 
     const works = profile.works || [];
 
-    // Get templates
     const { data: templates } = await supabase
       .from('templates')
       .select('*')
@@ -121,7 +109,6 @@ const runBatch = async (userId) => {
       return;
     }
 
-    // Get pending companies
     const { data: pending } = await supabase
       .from('companies')
       .select('*')
@@ -131,7 +118,6 @@ const runBatch = async (userId) => {
       .order('created_at', { ascending: true })
       .limit(settings.daily_limit);
 
-    // Check for follow-ups due
     const followupDaysAgo = new Date();
     followupDaysAgo.setDate(followupDaysAgo.getDate() - settings.followup_days);
 
@@ -146,11 +132,9 @@ const runBatch = async (userId) => {
     const toSend = [...(pending || [])];
     let sent     = 0;
 
-    // Send to pending companies
     for (const company of toSend) {
       if (sent >= settings.daily_limit) break;
 
-      // Get previously used template IDs for this company
       const { data: prevLogs } = await supabase
         .from('email_logs')
         .select('template_id')
@@ -173,7 +157,6 @@ const runBatch = async (userId) => {
           );
         }
 
-        // Wait interval between emails
         if (sent < toSend.length && settings.interval_minutes > 0) {
           await new Promise(resolve =>
             setTimeout(resolve, settings.interval_minutes * 60 * 1000)
@@ -182,7 +165,6 @@ const runBatch = async (userId) => {
       }
     }
 
-    // Send follow-ups
     if (followupTemplate && followupDue?.length > 0) {
       for (const company of followupDue) {
         if (sent >= settings.daily_limit) break;
@@ -205,7 +187,6 @@ const runBatch = async (userId) => {
       }
     }
 
-    // Check if list is exhausted
     const { data: remaining } = await supabase
       .from('companies')
       .select('id')
@@ -221,7 +202,6 @@ const runBatch = async (userId) => {
       );
     }
 
-    // Daily summary
     if (sent > 0 && settings.daily_summary_email) {
       await sendDailySummary(profile, sent);
     }
@@ -237,12 +217,12 @@ const runBatch = async (userId) => {
  */
 const sendDailySummary = async (profile, count) => {
   try {
-    const transporter = createTransporter(profile.gmail, profile.gmail_app_password);
-    await transporter.sendMail({
-      from:    `Reachio <${profile.gmail}>`,
-      to:      profile.gmail,
-      subject: `Reachio — Daily Summary: ${count} emails sent today`,
-      text:    `Hi ${profile.full_name},\n\nYour Reachio scheduler sent ${count} email${count !== 1 ? 's' : ''} today.\n\nLog in to see the full report.\n\nReachio`,
+    await resend.emails.send({
+      from:     'Reachio <onboarding@resend.dev>',
+      to:       [profile.gmail],
+      reply_to: profile.gmail,
+      subject:  `Reachio — Daily Summary: ${count} emails sent today`,
+      text:     `Hi ${profile.full_name},\n\nYour Reachio scheduler sent ${count} email${count !== 1 ? 's' : ''} today.\n\nLog in to see the full report.\n\nReachio`,
     });
   } catch (err) {
     console.error('Summary email error:', err.message);
